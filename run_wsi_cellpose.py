@@ -3,6 +3,8 @@
 run_wsi_cellpose.py — 模仿 cerberus/run_infer_wsi.py 的 Cellpose WSI 入口
                      Cellpose 负责推理，Cerberus 负责拼整块（4类瓦片 + STRtree 去重）
 
+
+python run_wsi_cellpose.py --input_dir /media/linjiatai/086399513677BED7/zhang/dataset/test --output_dir /media/linjiatai/086399513677BED7/zhang/dataset/test_out/test2 --save_viz_highres  --viz_highres_tile 4096  --viz_highres_max_tiles -1
 ==================== 完整用法 ====================
 
 1) 仅推理（最快，不画图）：

@@ -444,7 +444,8 @@ class CellposeWSI:
                                    flow_threshold=0.4, cellprob_threshold=0.0, min_size=15,
                                    diameter=None, bsize=256, tile_overlap=0.1,
                                    nr_post_proc_workers=0,
-                                   save_viz_highres=False, viz_highres_tile=2048, viz_highres_mpp=None, viz_highres_max_tiles=16):
+                                   save_viz_highres=False, viz_highres_tile=2048, viz_highres_mpp=None, viz_highres_max_tiles=16,
+                                   save_viz_highres_full=False, viz_highres_full_max_mpix=120):
         """轻量 direct 模式 — 推荐"""
         from concurrent.futures import ProcessPoolExecutor, as_completed
         resolution = {"resolution": wsi_proc_mag, "units": "mpp"}
@@ -708,6 +709,81 @@ class CellposeWSI:
                     out_path_hr = os.path.join(hr_root, f"{basename}_x{tx}_y{ty}_w{w}_h{h}.png")
                     cv2.imwrite(out_path_hr, canvas_hr)
                 self.logger.info(f"Saved {len(candidates)} highres viz tiles to {hr_root}")
+                # Optional: stitched full high-res image (single file)
+                if save_viz_highres_full:
+                    try:
+                        mpix = viz_w * viz_h / 1e6
+                        limit = float(viz_highres_full_max_mpix)
+                        if mpix > limit:
+                            self.logger.warning(f"Skip full high-res stitch: {viz_w}x{viz_h} = {mpix:.1f} MP > limit {limit:.1f} MP. Increase --viz_highres_full_max_mpix or use tiled viz. To avoid OOM/crash.")
+                        else:
+                            # Estimate RAM: viz_h*viz_w*3 bytes
+                            est_gb = viz_w * viz_h * 3 / (1024**3)
+                            self.logger.info(f"Stitching full high-res {viz_w}x{viz_h} ({mpix:.1f} MP, ~{est_gb:.2f} GB) ...")
+                            # Use memmap to avoid RAM spike, then stream tiles into it
+                            import tempfile
+                            tmp_mmap = os.path.join(hr_root, f"_tmp_full_{basename}.dat")
+                            full = np.memmap(tmp_mmap, dtype=np.uint8, mode='w+', shape=(viz_h, viz_w, 3))
+                            # Fill by re-reading tiles (all, not sampled) and drawing
+                            # Build full candidates (all tiles, not sampled)
+                            xs_all = list(range(0, viz_w, tile))
+                            ys_all = list(range(0, viz_h, tile))
+                            full_cands = []
+                            for yy in ys_all:
+                                for xx in xs_all:
+                                    x1 = min(xx+tile, viz_w); y1 = min(yy+tile, viz_h)
+                                    px0, py0 = int(xx/scale), int(yy/scale)
+                                    px1, py1 = int(x1/scale), int(y1/scale)
+                                    if px1<=px0 or py1<=py0: continue
+                                    if np.sum(wsi_mask[py0:py1, px0:px1]) == 0: continue
+                                    full_cands.append((xx,yy,x1,y1))
+                            self.logger.info(f"Full stitch: {len(full_cands)} tiles")
+                            rdr_full = WSIReader.open(wsi_path)
+                            for tx,ty,tx1,ty1 in tqdm.tqdm(full_cands, desc="Stitch full highres", ncols=90):
+                                w,h = tx1-tx, ty1-ty
+                                try:
+                                    img_hr = rdr_full.read_rect(location=(tx,ty), size=(w,h), resolution=viz_mpp, units="mpp", coord_space="resolution")
+                                    if img_hr.shape[-1]==4: img_hr=img_hr[...,:3]
+                                    canvas = cv2.cvtColor(img_hr, cv2.COLOR_RGB2BGR)
+                                except Exception:
+                                    try:
+                                        img_hr = rdr_full.read_rect(location=(tx,ty), size=(w,h), resolution=viz_mpp, units="mpp")
+                                        if img_hr.shape[-1]==4: img_hr=img_hr[...,:3]
+                                        canvas = cv2.cvtColor(img_hr, cv2.COLOR_RGB2BGR)
+                                    except Exception as e2:
+                                        continue
+                                # draw intersecting contours
+                                for (viz_box, cnt_scaled) in scaled_items:
+                                    if viz_box[1][0] < tx or viz_box[0][0] > tx1 or viz_box[1][1] < ty or viz_box[0][1] > ty1: continue
+                                    pts = (cnt_scaled - np.array([tx,ty])).astype(np.int32)
+                                    if pts[:,0].max()<0 or pts[:,0].min()>=w or pts[:,1].max()<0 or pts[:,1].min()>=h: continue
+                                    cv2.polylines(canvas, [pts], True, (0,255,0), 1)
+                                full[ty:ty1, tx:tx1] = canvas
+                            # flush and save as tiled BigTIFF then PNG? Use cv2.imwrite via memmap->array may still OOM, so write as BigTIFF then optionally PNG if small
+                            full.flush()
+                            out_full = os.path.join(os.path.dirname(hr_root), f"{basename}_full_{viz_mpp:.3f}mpp.png")
+                            # If image is huge, prefer TIFF to avoid PNG 2GB limit; use tifffile
+                            if mpix > 60:
+                                out_full = out_full.replace(".png", ".tiff")
+                                try:
+                                    import tifffile
+                                    # tifffile can write big images from memmap incrementally? write directly
+                                    tifffile.imwrite(out_full, np.array(full), tile=(512,512), bigtiff=True, compression='lzw')
+                                    self.logger.info(f"Saved full high-res BigTIFF to {out_full}")
+                                except Exception as e:
+                                    self.logger.warning(f"tifffile BigTIFF failed {e}, fallback to cv2")
+                                    cv2.imwrite(out_full, np.array(full))
+                                    self.logger.info(f"Saved full high-res to {out_full}")
+                            else:
+                                cv2.imwrite(out_full, np.array(full))
+                                self.logger.info(f"Saved full high-res to {out_full}")
+                            # cleanup memmap
+                            del full
+                            try: os.remove(tmp_mmap)
+                            except: pass
+                    except Exception as e:
+                        import traceback
+                        self.logger.warning(f"full highres stitch failed: {e}\n{traceback.format_exc()}")
             except Exception as e:
                 import traceback
                 self.logger.warning(f"highres viz failed: {e}\n{traceback.format_exc()}")
@@ -718,7 +794,8 @@ class CellposeWSI:
                          flow_threshold=0.4, cellprob_threshold=0.0, min_size=15,
                          diameter=None, save_thumb=False, save_mask=False,
                          nr_post_proc_workers=0, logging_dir=None,
-                         save_viz_highres=False, viz_highres_tile=2048, viz_highres_mpp=None, viz_highres_max_tiles=16):
+                         save_viz_highres=False, viz_highres_tile=2048, viz_highres_mpp=None, viz_highres_max_tiles=16,
+                         save_viz_highres_full=False, viz_highres_full_max_mpix=120):
         os.makedirs(output_dir, exist_ok=True)
         os.makedirs(f"{output_dir}/dat", exist_ok=True)
         if save_thumb: os.makedirs(f"{output_dir}/thumb", exist_ok=True)
@@ -839,7 +916,8 @@ class CellposeWSI:
                 ambiguous_size=ambiguous_size, flow_threshold=flow_threshold,
                 cellprob_threshold=cellprob_threshold, min_size=min_size,
                 diameter=diameter, nr_post_proc_workers=nr_post_proc_workers,
-                save_viz_highres=save_viz_highres, viz_highres_tile=viz_highres_tile, viz_highres_mpp=viz_highres_mpp, viz_highres_max_tiles=viz_highres_max_tiles
+                save_viz_highres=save_viz_highres, viz_highres_tile=viz_highres_tile, viz_highres_mpp=viz_highres_mpp, viz_highres_max_tiles=viz_highres_max_tiles,
+                save_viz_highres_full=save_viz_highres_full, viz_highres_full_max_mpix=viz_highres_full_max_mpix
             )
 
 
